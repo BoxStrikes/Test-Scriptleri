@@ -1,0 +1,2 @@
+# Test sırasında Wireshark'ta bu filtre:
+ip.dst == 127.0.0.1 && tcp.port == 80
